@@ -1,0 +1,212 @@
+// Jenkinsfile - Declarative pipeline for the "airbnb" project
+// Comments explain each stage and the choices made.
+// Adjust registry URLs, credentials IDs and any commands to match your stack.
+
+// When this file is placed at the repo root and a Multibranch Pipeline or Pipeline job
+// is configured in Jenkins, this pipeline will run on the checked-out source.
+
+pipeline {
+    agent any
+
+    // Parameters to control the build
+    parameters {
+        string(name: 'BRANCH', defaultValue: 'main', description: 'Git branch to build')
+        booleanParam(name: 'DEPLOY', defaultValue: false, description: 'Deploy to staging after successful build')
+    }
+
+    // Set defaults for docker registry and image name — update these to your environment.
+    environment {
+        DOCKER_REGISTRY = 'registry.example.com'         // change to your registry
+        IMAGE_NAME = 'airbnb'                            // container image name
+        DOCKER_CRED_ID = 'docker-creds-id'               // Jenkins credential id for registry (username/password)
+        SSH_CRED_ID = 'ssh-deploy-key-id'                // Jenkins SSH key credential id for deploy (if used)
+        DEPLOY_HOST = 'staging.example.com'              // deploy target host
+    }
+
+    options {
+        // Stop executing downstream stages once a stage is unstable/failed
+        skipStagesAfterUnstable()
+        timestamps()
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                // Use branch parameter; for multibranch pipelines you may prefer "checkout scm"
+                // If your job is configured with SCM, replace the git step with "checkout scm".
+                git branch: "${params.BRANCH}", url: 'https://your.git.repo/airbnb.git'
+            }
+        }
+
+        stage('Detect project type') {
+            steps {
+                script {
+                    // Detect common project types by presence of files so we can run appropriate commands later.
+                    env.IS_NODE = fileExists('package.json') ? 'true' : 'false'
+                    env.IS_RAILS = fileExists('Gemfile') ? 'true' : 'false'
+                }
+                // Print detected type for logs
+                sh '''
+                    echo "IS_NODE=${IS_NODE}"
+                    echo "IS_RAILS=${IS_RAILS}"
+                '''
+            }
+        }
+
+        stage('Install / Prepare') {
+            steps {
+                // Install dependencies according to detected project type.
+                // Add other branches (python, go, etc.) as required.
+                sh '''
+                    if [ "${IS_NODE}" = "true" ]; then
+                        echo "Detected Node.js project: installing with npm"
+                        npm ci
+                    elif [ "${IS_RAILS}" = "true" ]; then
+                        echo "Detected Rails project: installing gems"
+                        bundle install --jobs 4 --retry 3
+                    else
+                        echo "Generic project: no install step defined"
+                    fi
+                '''
+            }
+        }
+
+        stage('Lint') {
+            steps {
+                sh '''
+                    if [ "${IS_NODE}" = "true" ]; then
+                        # run linter if configured
+                        if grep -q "\"lint\"" package.json; then
+                            npm run lint || true  # don't fail pipeline for missing/unstable linter by default
+                        else
+                            echo "No lint script in package.json"
+                        fi
+                    elif [ "${IS_RAILS}" = "true" ]; then
+                        # optionally run rubocop if present
+                        if gem list -i rubocop >/dev/null 2>&1; then
+                            bundle exec rubocop || true
+                        else
+                            echo "Rubocop not installed"
+                        fi
+                    else
+                        echo "No lint step for this project type"
+                    fi
+                '''
+            }
+        }
+
+        stage('Test') {
+            steps {
+                // Run tests and try to emit JUnit XML if possible for Jenkins test reports
+                sh '''
+                    if [ "${IS_NODE}" = "true" ]; then
+                        if grep -q "\"test\"" package.json; then
+                            npm test -- --reporter=mocha-junit-reporter || true
+                        else
+                            echo "No npm test script"
+                        fi
+                    elif [ "${IS_RAILS}" = "true" ]; then
+                        bundle exec rake test || true
+                    else
+                        echo "No test runner configured for this project"
+                    fi
+                '''
+            }
+            post {
+                // Attempt to collect common test reports (adjust patterns to match your test reporters)
+                always {
+                    junit allowEmptyResults: true, testResults: '**/test-results/**/*.xml, **/junit-*.xml, **/TEST-*.xml'
+                }
+            }
+        }
+
+        stage('Build / Package') {
+            steps {
+                sh '''
+                    if [ "${IS_NODE}" = "true" ]; then
+                        if grep -q "\"build\"" package.json; then
+                            npm run build
+                        else
+                            echo "No build script; skipping build"
+                        fi
+                    elif [ "${IS_RAILS}" = "true" ]; then
+                        bundle exec rake assets:precompile
+                    else
+                        echo "No generic build step defined"
+                    fi
+                '''
+            }
+            // Archive common artifact locations so Jenkins can keep them
+            post {
+                success {
+                    archiveArtifacts artifacts: 'build/**, public/**, dist/**', allowEmptyArchive: true
+                }
+            }
+        }
+
+        stage('Containerize and Push') {
+            when {
+                expression { return env.DOCKER_REGISTRY != null && env.DOCKER_REGISTRY != '' }
+            }
+            steps {
+                script {
+                    // Use short git SHA for tagging
+                    GIT_SHORT = sh(script: "git rev-parse --short=7 HEAD", returnStdout: true).trim()
+                    IMAGE = "${env.DOCKER_REGISTRY}/${env.IMAGE_NAME}:${GIT_SHORT}"
+                    env.IMAGE = IMAGE
+                }
+
+                // Login and push image — requires DOCKER_CRED_ID to be set in Jenkins
+                withCredentials([usernamePassword(credentialsId: "${env.DOCKER_CRED_ID}", usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
+                    sh '''
+                        echo "$DOCKER_PASS" | docker login -u "$DOCKER_USER" --password-stdin ${DOCKER_REGISTRY}
+                        docker build -t ${IMAGE} .
+                        docker push ${IMAGE}
+                        docker logout ${DOCKER_REGISTRY}
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy to Staging') {
+            when {
+                allOf {
+                    expression { return params.DEPLOY }
+                }
+            }
+            steps {
+                // Example: simple SSH deploy that pulls the image on the remote host and restarts a service.
+                // Replace with your orchestration (k8s, ECS, Fabric, Ansible, etc.)
+                withCredentials([sshUserPrivateKey(credentialsId: "${env.SSH_CRED_ID}", keyFileVariable: 'SSH_KEY', usernameVariable: 'SSH_USER')]) {
+                    sh '''
+                        chmod 600 "$SSH_KEY"
+                        # copy any deploy scripts or run remote commands; this is an example of docker-based deploy
+                        ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no ${SSH_USER}@${DEPLOY_HOST} <<'EOF'
+                            docker pull ${IMAGE} || exit 1
+                            # Example systemd service restart or docker-compose update:
+                            # docker-compose -f /opt/airbnb/docker-compose.yml up -d
+                            # or restart a container:
+                            docker stop airbnb || true
+                            docker rm airbnb || true
+                            docker run -d --name airbnb -p 80:3000 ${IMAGE}
+                        EOF
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            // Clean workspace to reduce disk usage on build nodes
+            cleanWs()
+        }
+        failure {
+            // Add notifications (Slack, email) as needed using Jenkins plugins and credentials
+            echo 'Build failed — consider notifying the team'
+        }
+        success {
+            echo "Build succeeded for branch ${params.BRANCH}"
+        }
+    }
+}
