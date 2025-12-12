@@ -1,7 +1,26 @@
 pipeline{
     agent {
         docker {
-            image ''
+            image 'airbnb-app:v1'
+            args '--user root'
+        }
+    }
+    stages {
+        stage('Checkout') {
+            steps {
+                sh 'echo passed'
+            }
+        }
+        stage('Build and Test') {
+            steps {
+                sh 'ls -ltr'
+                sh 'cd CI-CD-pipeline && npm ci && npm run build' //create build
+            }
+        }
+        stage('Static Code Analysis') {
+            environment {
+                
+            }
         }
     }
 }
